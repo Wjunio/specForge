@@ -1,0 +1,107 @@
+{
+  "name": "specforge",
+  "displayName": "SpecForge",
+  "description": "Analisa projetos Angular, gera testes de Component e Service e prova que executam no runner configurado.",
+  "version": "0.1.0",
+  "publisher": "ArtePrime",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Testing",
+    "Other"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "specForge.projectTestConfiguration",
+        "title": "SpecForge: Project Test Configuration"
+      },
+      {
+        "command": "specForge.generateTest",
+        "title": "SpecForge: Generate Test"
+      },
+      {
+        "command": "specForge.generateComponentTest",
+        "title": "SpecForge: Generate Component Test"
+      },
+      {
+        "command": "specForge.generateServiceTest",
+        "title": "SpecForge: Generate Service Test"
+      },
+      {
+        "command": "specForge.runTest",
+        "title": "SpecForge: Run Test"
+      },
+      {
+        "command": "specForge.runTestFile",
+        "title": "SpecForge: Run Test File"
+      },
+      {
+        "command": "specForge.runTestAtCursor",
+        "title": "SpecForge: Run Test at Cursor"
+      }
+    ],
+    "configuration": {
+      "title": "SpecForge",
+      "properties": {
+        "specForge.framework": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "jasmine",
+            "jest",
+            "vitest"
+          ],
+          "default": "auto"
+        },
+        "specForge.generateMocks": {
+          "type": "boolean",
+          "default": true
+        },
+        "specForge.analyzeTemplates": {
+          "type": "boolean",
+          "default": false
+        },
+        "specForge.analyzeCoverage": {
+          "type": "boolean",
+          "default": false
+        },
+        "specForge.overwriteTests": {
+          "type": "boolean",
+          "default": false
+        },
+        "specForge.testFileSuffix": {
+          "type": "string",
+          "default": ".spec.ts"
+        },
+        "specForge.maxRepairAttempts": {
+          "type": "number",
+          "default": 3,
+          "minimum": 0,
+          "maximum": 5
+        },
+        "specForge.targetCoverage": {
+          "type": "number",
+          "default": 100,
+          "minimum": 0,
+          "maximum": 100
+        }
+      }
+    }
+  },
+  "scripts": {
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
+    "compile": "npm run clean && tsc -p .",
+    "watch": "tsc -w -p .",
+    "test": "npm run compile && node --test dist/test/*.test.js",
+    "test:coverage": "npm run compile && node --test --experimental-test-coverage dist/test/*.test.js",
+    "vscode:prepublish": "npm run compile"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.7.2"
+  }
+}
