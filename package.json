@@ -110,7 +110,7 @@
     "test:coverage": "npm run compile && node --test --experimental-test-coverage dist/test/*.test.js",
     "vscode:prepublish": "npm run compile",
     "package:vsix": "vsce package",
-    "publish:marketplace": "vsce publish patch"
+    "publish:marketplace": "npm test && vsce publish patch"
   },
   "dependencies": {
     "typescript": "^5.7.2"
