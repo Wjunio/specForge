@@ -2,7 +2,7 @@
   "name": "specforge-angular-tests",
   "displayName": "SpecForge Angular Test Generator",
   "description": "Analisa projetos Angular, gera testes de Component e Service e prova que executam no runner configurado.",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "publisher": "ArtePrime",
   "license": "MIT",
   "pricing": "Free",
@@ -109,7 +109,7 @@
     "test": "npm run compile && node --test dist/test/*.test.js",
     "test:coverage": "npm run compile && node --test --experimental-test-coverage dist/test/*.test.js",
     "vscode:prepublish": "npm run compile",
-    "package:vsix": "vsce package",
+    "package:vsix": "npm test && npm version patch --no-git-tag-version && vsce package",
     "publish:marketplace": "npm test && vsce publish patch"
   },
   "dependencies": {
