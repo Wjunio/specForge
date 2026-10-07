@@ -2,7 +2,7 @@
   "name": "specforge",
   "displayName": "SpecForge",
   "description": "Analisa projetos Angular, gera testes de Component e Service e prova que executam no runner configurado.",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "publisher": "ArtePrime",
   "license": "MIT",
   "pricing": "Free",
