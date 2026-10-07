@@ -6,7 +6,7 @@
   "publisher": "ArtePrime",
   "license": "MIT",
   "pricing": "Free",
-  "icon": "images/icon-spec-forge.png",
+  "icon": "src/images/icon-spec-forge.png",
   "repository": {
     "type": "git",
     "url": "https://github.com/Wjunio/specForge.git"
@@ -108,13 +108,16 @@
     "watch": "tsc -w -p .",
     "test": "npm run compile && node --test dist/test/*.test.js",
     "test:coverage": "npm run compile && node --test --experimental-test-coverage dist/test/*.test.js",
-    "vscode:prepublish": "npm run compile"
+    "vscode:prepublish": "npm run compile",
+    "package:vsix": "vsce package",
+    "publish:marketplace": "vsce publish patch"
   },
   "dependencies": {
     "typescript": "^5.7.2"
   },
   "devDependencies": {
     "@types/node": "^20.17.0",
-    "@types/vscode": "^1.85.0"
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^4.0.0"
   }
 }
