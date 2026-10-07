@@ -1,6 +1,6 @@
 {
   "name": "specforge-angular-tests",
-  "displayName": "SpecForge",
+  "displayName": "SpecForge Angular Test Generator",
   "description": "Analisa projetos Angular, gera testes de Component e Service e prova que executam no runner configurado.",
   "version": "0.0.2",
   "publisher": "ArtePrime",
