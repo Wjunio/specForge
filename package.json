@@ -2,8 +2,19 @@
   "name": "specforge",
   "displayName": "SpecForge",
   "description": "Analisa projetos Angular, gera testes de Component e Service e prova que executam no runner configurado.",
-  "version": "0.1.0",
+  "version": "0.0.1",
   "publisher": "ArtePrime",
+  "license": "MIT",
+  "pricing": "Free",
+  "icon": "images/icon-spec-forge.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Wjunio/specForge.git"
+  },
+  "homepage": "https://github.com/Wjunio/specForge#readme",
+  "bugs": {
+    "url": "https://github.com/Wjunio/specForge/issues"
+  },
   "engines": {
     "vscode": "^1.85.0"
   },
@@ -99,9 +110,11 @@
     "test:coverage": "npm run compile && node --test --experimental-test-coverage dist/test/*.test.js",
     "vscode:prepublish": "npm run compile"
   },
+  "dependencies": {
+    "typescript": "^5.7.2"
+  },
   "devDependencies": {
     "@types/node": "^20.17.0",
-    "@types/vscode": "^1.85.0",
-    "typescript": "^5.7.2"
+    "@types/vscode": "^1.85.0"
   }
 }
