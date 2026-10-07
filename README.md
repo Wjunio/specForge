@@ -16,6 +16,7 @@ real do projeto e finalizado com sucesso.
 - geração de testes para `Component` e `Service`;
 - mocks específicos para cada framework;
 - análise de propriedades, métodos, dependências, `@Inject` e `@Optional`;
+- reconhecimento de dependências declaradas com `inject()`, formulários reativos e operações básicas de Signals;
 - suporte a Observables e chamadas simples de `HttpClient`;
 - cenários reconhecidos para HTTP, condições, agregações, atualizações em lote e timers RxJS;
 - execução de arquivo completo ou teste selecionado pelo cursor;
@@ -130,7 +131,7 @@ extensão somente em projetos confiáveis.
 
 - a geração é determinística e baseada em padrões reconhecidos na AST, sem análise
   simbólica completa de qualquer programa TypeScript;
-- templates Angular e Signals ainda não são analisados;
+- templates Angular ainda não são analisados; Signals possuem suporte a valores iniciais, `set()` literal/parametrizado e toggles com `update()`;
 - cobertura e reparo automático ainda não estão implementados;
 - URLs e fluxos HTTP muito dinâmicos podem exigir ajustes manuais;
 - `Run Test at Cursor` exige título literal em `it('...')` ou `test('...')`;

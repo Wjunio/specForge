@@ -11,7 +11,7 @@ export interface FrameworkSyntax {
 export function generateAngularTest(context: TestGenerationContext, syntax: FrameworkSyntax): string {
   const relativeImport = `./${path.basename(context.sourceFile, '.ts')}`;
   const http = context.dependencies.some(item => item.type === 'HttpClient');
-  const dependencies = context.dependencies.filter(item => item.type !== 'HttpClient' && !item.optional);
+  const dependencies = context.dependencies.filter(item => item.type !== 'HttpClient' && item.type !== 'FormBuilder' && !item.optional);
   const lines: string[] = [];
   if (syntax.globalsImport) lines.push(syntax.globalsImport);
   if (context.dependencies.some(item => item.type !== 'HttpClient' && item.observableMethods.length)) lines.push("import { of } from 'rxjs';");
@@ -28,6 +28,7 @@ export function generateAngularTest(context: TestGenerationContext, syntax: Fram
   for (const dependency of dependencies) {
     lines.push(`    ${dependency.name}Mock = ${syntax.mock(dependency.name, dependency.methods, dependency.observableMethods)};`);
     if (syntax.configureObservableMock) for (const method of dependency.observableMethods) lines.push(`    ${syntax.configureObservableMock(dependency.name, method)}`);
+    if (dependency.type === 'ActivatedRoute') lines.push(`    ${dependency.name}Mock.snapshot = { queryParamMap: { get: () => null } };`);
   }
   const providers = [`${context.className}`, ...dependencies.map(item => `{ provide: ${item.providerToken}, useValue: ${item.name}Mock }`)].join(', ');
   if (context.entityType === 'component') {
@@ -50,6 +51,9 @@ export function generateAngularTest(context: TestGenerationContext, syntax: Fram
   for (const property of context.properties.filter(item => item.isPublic && isStableLiteral(item.initializer))) {
     lines.push('', `  it('should initialize ${property.name} with its declared value', () => {`, `    expect(subject.${property.name}).toEqual(${property.initializer});`, '  });');
   }
+  for (const property of context.properties.filter(item => item.isPublic && isStableLiteral(item.signalInitialValue))) {
+    lines.push('', `  it('should initialize ${property.name} signal with its declared value', () => {`, `    expect(subject.${property.name}()).toEqual(${property.signalInitialValue});`, '  });');
+  }
   for (const usage of context.httpUsage) {
     const url = preferredUrl(usage.urls);
     if (!url) continue;
@@ -64,13 +68,64 @@ export function generateAngularTest(context: TestGenerationContext, syntax: Fram
   }
   const httpMethods = new Set(context.httpUsage.map(item => item.methodName));
   for (const method of context.methods.filter(item => item.isPublic && item.parameterCount === 0 && item.dependencyCalls.some(call => !call.deferred) && !httpMethods.has(item.name))) {
-    lines.push('', `  it('should delegate dependencies when ${method.name} is called', () => {`, `    subject.${method.name}();`);
+    lines.push('', `  it('should delegate dependencies when ${method.name} is called', () => {`);
+    appendValidFormSetup(lines, context, method.name, '    ');
+    lines.push(`    subject.${method.name}();`);
     for (const call of method.dependencyCalls.filter(call => !call.deferred && dependencies.some(dependency => dependency.name === call.dependency))) lines.push(`    expect(${call.dependency}Mock.${call.method}).toHaveBeenCalled();`);
     lines.push('  });');
   }
+  appendSignalScenarios(lines, context);
   appendKnownBehaviorScenarios(lines, context, syntax);
   lines.push('});', '');
   return lines.join('\n');
+}
+
+function appendValidFormSetup(lines: string[], context: TestGenerationContext, methodName: string, indentation: string): void {
+  const method = context.methods.find(item => item.name === methodName);
+  if (!method || !/login|submit|save/i.test(methodName)) return;
+  const form = context.properties.find(property => property.formValues);
+  if (!form?.formValues) return;
+  const values = Object.entries(form.formValues).map(([name, value]) => `${name}: ${value}`).join(', ');
+  lines.push(`${indentation}subject.${form.name}.setValue({ ${values} });`);
+}
+
+function appendSignalScenarios(lines: string[], context: TestGenerationContext): void {
+  const publicSignals = new Set(context.properties.filter(property => property.isPublic && property.signalInitialValue !== undefined).map(property => property.name));
+  for (const method of context.methods.filter(item => item.isPublic)) {
+    const operations = method.signalOperations.filter(operation => publicSignals.has(operation.signal));
+    const toggle = operations.find(operation => operation.operation === 'toggle');
+    if (toggle && method.parameterCount === 0) {
+      lines.push('', `  it('should toggle ${toggle.signal} when ${method.name} is called', () => {`, `    const previous = subject.${toggle.signal}();`, `    subject.${method.name}();`, `    expect(subject.${toggle.signal}()).toBe(!previous);`, '  });');
+    }
+    if (method.parameterCount === 1) {
+      const parameter = method.parameterNames[0];
+      const matching = operations.find(operation => operation.operation === 'set' && operation.value === parameter);
+      if (matching) {
+        lines.push('', `  it('should update ${matching.signal} when ${method.name} is called', () => {`, "    const value = 'test value';", `    subject.${method.name}(value);`, `    expect(subject.${matching.signal}()).toBe(value);`, '  });');
+      }
+    }
+    if (method.parameterCount === 0) {
+      const assignments = operations.filter(operation => operation.operation === 'set' && isStableLiteral(operation.value));
+      if (assignments.length) {
+        lines.push('', `  it('should update signal state when ${method.name} is called', () => {`);
+        for (const assignment of assignments) {
+          const differentValue = alternateLiteral(assignment.value!);
+          if (differentValue) lines.push(`    subject.${assignment.signal}.set(${differentValue});`);
+        }
+        lines.push(`    subject.${method.name}();`);
+        for (const assignment of assignments) lines.push(`    expect(subject.${assignment.signal}()).toEqual(${assignment.value});`);
+        lines.push('  });');
+      }
+    }
+  }
+}
+
+function alternateLiteral(value: string): string | undefined {
+  if (value === "''" || value === '\"\"' || value === '``') return "'previous value'";
+  if (value === 'true') return 'false';
+  if (value === 'false') return 'true';
+  if (/^-?\d+(?:\.\d+)?$/.test(value)) return value === '0' ? '1' : '0';
+  return undefined;
 }
 
 function isStableLiteral(value?: string): boolean { return Boolean(value && /^(?:true|false|null|undefined|-?\d+(?:\.\d+)?|['"`][^`'"]*['"`]|\[\]|\{\})$/.test(value)); }

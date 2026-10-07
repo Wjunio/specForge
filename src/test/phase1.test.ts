@@ -60,6 +60,49 @@ test('configures observable dependency mocks for subscribe-based component behav
   assert.match(jasmine, /getUsers\.and\.returnValue\(of\(\[\]\)\)/);
 });
 
+test('supports inject fields, implicit standalone components, signals, and reactive forms additively', () => {
+  const source = `import { Component, inject, signal } from '@angular/core';
+    import { FormBuilder, ReactiveFormsModule, Validators } from '@angular/forms';
+    import { ActivatedRoute, Router } from '@angular/router';
+    import { AuthService } from './auth.service';
+    @Component({ selector: 'app-login', imports: [ReactiveFormsModule], template: '' })
+    export class LoginComponent {
+      private readonly formBuilder = inject(FormBuilder);
+      private readonly authService = inject(AuthService);
+      private readonly router = inject(Router);
+      private readonly route = inject(ActivatedRoute);
+      readonly showPassword = signal(false);
+      readonly errorMessage = signal('');
+      readonly form = this.formBuilder.nonNullable.group({ email: ['', [Validators.required, Validators.email]], password: ['', Validators.required], remember: [false] });
+      handleSocialLogin() { const target = this.route.snapshot.queryParamMap.get('redirectTo') || '/app'; void this.router.navigateByUrl(target); }
+      handleSocialLoginError(message: string) { this.errorMessage.set(message); }
+      login() { if (this.form.invalid) return; this.authService.login(this.form.getRawValue()).subscribe(() => this.router.navigateByUrl('/app')); }
+      togglePasswordVisibility() { this.showPassword.update(current => !current); }
+      dismissErrorMessage() { this.errorMessage.set(''); }
+    }`;
+  const context = analyzeSource('C:/workspace/body-login.ts', source, diagnostic(TestFramework.Jest, TestRunner.Jest));
+  const spec = new JestAdapter().generateComponentTest(context);
+  assert.equal(context.standalone, true);
+  assert.deepEqual(context.dependencies.map(item => item.type), ['FormBuilder', 'AuthService', 'Router', 'ActivatedRoute']);
+  assert.deepEqual(context.dependencies.find(item => item.type === 'AuthService')?.observableMethods, ['login']);
+  assert.match(spec, /imports: \[LoginComponent\]/);
+  assert.doesNotMatch(spec, /provide: FormBuilder/);
+  assert.match(spec, /provide: AuthService/);
+  assert.match(spec, /routeMock\.snapshot/);
+  assert.match(spec, /subject\.form\.setValue\(\{ email: 'user@example\.com', password: 'password', remember: false \}\)/);
+  assert.match(spec, /should initialize showPassword signal/);
+  assert.match(spec, /should toggle showPassword/);
+  assert.match(spec, /should update errorMessage/);
+  assert.match(spec, /should update signal state when dismissErrorMessage is called/);
+});
+
+test('respects an explicit standalone false setting', () => {
+  const source = `@Component({ standalone: false, template: '' }) export class LegacyComponent {}`;
+  const context = analyzeSource('C:/workspace/legacy.component.ts', source, diagnostic(TestFramework.Jest, TestRunner.Jest));
+  assert.equal(context.standalone, false);
+  assert.match(new JestAdapter().generateComponentTest(context), /declarations: \[LegacyComponent\]/);
+});
+
 test('rejects unsupported entity types', () => {
   assert.throws(() => analyzeSource('thing.pipe.ts', 'export class ThingPipe {}', diagnostic(TestFramework.Jest, TestRunner.Jest)), /somente Component e Service/);
 });

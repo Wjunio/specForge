@@ -11,8 +11,8 @@ export function analyzeSource(sourceFile: string, sourceCode: string, diagnostic
   const entityType: EntityType = decoratorName === 'Component' || /\.component\.ts$/i.test(sourceFile) ? 'component'
     : decoratorName === 'Injectable' || /\.service\.ts$/i.test(sourceFile) ? 'service'
       : (() => { throw new Error('A Fase 1 suporta somente Component e Service.'); })();
-  const standalone = Boolean(decorator?.arguments[0] && ts.isObjectLiteralExpression(decorator.arguments[0]) && decorator.arguments[0].properties.some(property =>
-    ts.isPropertyAssignment(property) && property.name.getText(file) === 'standalone' && property.initializer.kind === ts.SyntaxKind.TrueKeyword));
+  const standaloneSetting = componentStandaloneSetting(decorator, file);
+  const standalone = standaloneSetting ?? usesStandaloneByDefault(diagnostic);
   const constructor = declaration.members.find(ts.isConstructorDeclaration);
   const imports = new Map<string, string>();
   for (const statement of file.statements.filter(ts.isImportDeclaration)) {
@@ -21,18 +21,27 @@ export function analyzeSource(sourceFile: string, sourceCode: string, diagnostic
     if (clause?.name) imports.set(clause.name.text, statement.moduleSpecifier.text);
     if (clause?.namedBindings && ts.isNamedImports(clause.namedBindings)) for (const element of clause.namedBindings.elements) imports.set(element.name.text, statement.moduleSpecifier.text);
   }
-  const dependencies: DependencyInfo[] = (constructor?.parameters ?? []).map(parameter => ({
+  const constructorDependencies: DependencyInfo[] = (constructor?.parameters ?? []).map(parameter => ({
     name: ts.isIdentifier(parameter.name) ? parameter.name.text : 'dependency',
     type: parameter.type?.getText(file) ?? 'unknown',
     providerToken: injectedToken(parameter, file) ?? providerToken(parameter.type?.getText(file) ?? ''),
     importPath: imports.get(providerToken(parameter.type?.getText(file) ?? '')),
     optional: hasDecorator(parameter, 'Optional'), methods: [], observableMethods: []
   }));
+  const injectedDependencies: DependencyInfo[] = declaration.members.filter(ts.isPropertyDeclaration).flatMap(member => {
+    if (!ts.isIdentifier(member.name) || !member.initializer || !ts.isCallExpression(member.initializer) || member.initializer.expression.getText(file) !== 'inject') return [];
+    const token = member.initializer.arguments[0];
+    if (!token) return [];
+    const provider = token.getText(file);
+    return [{ name: member.name.text, type: provider, providerToken: provider, importPath: imports.get(provider), optional: false, methods: [], observableMethods: [] }];
+  });
+  const dependencies: DependencyInfo[] = [...constructorDependencies, ...injectedDependencies];
   const dependencyMap = new Map(dependencies.map(item => [item.name, item]));
   const methods: MethodInfo[] = []; const httpUsage: HttpUsageInfo[] = [];
   for (const member of declaration.members.filter(ts.isMethodDeclaration)) {
     if (!member.name || !ts.isIdentifier(member.name)) continue;
     const calls: Array<{ dependency: string; method: string; deferred: boolean }> = [];
+    const signalOperations: MethodInfo['signalOperations'] = [];
     const visit = (node: ts.Node): void => {
       if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression)) {
         const target = node.expression.expression;
@@ -51,14 +60,21 @@ export function analyzeSource(sourceFile: string, sourceCode: string, diagnostic
             });
           }
         }
+        if (ts.isPropertyAccessExpression(target) && target.expression.kind === ts.SyntaxKind.ThisKeyword) {
+          const signal = target.name.text;
+          const operation = node.expression.name.text;
+          if (operation === 'set' && node.arguments[0]) signalOperations.push({ signal, operation: 'set', value: node.arguments[0].getText(file) });
+          if (operation === 'update' && node.arguments[0] && isBooleanToggle(node.arguments[0], file)) signalOperations.push({ signal, operation: 'toggle' });
+        }
       }
       ts.forEachChild(node, visit);
     };
     if (member.body) visit(member.body);
-    methods.push({ name: member.name.text, parameterCount: member.parameters.length, isPublic: !hasModifier(member, ts.SyntaxKind.PrivateKeyword) && !hasModifier(member, ts.SyntaxKind.ProtectedKeyword), dependencyCalls: uniqueCalls(calls) });
+    methods.push({ name: member.name.text, parameterCount: member.parameters.length, parameterNames: member.parameters.map(parameter => parameter.name.getText(file)), isPublic: !hasModifier(member, ts.SyntaxKind.PrivateKeyword) && !hasModifier(member, ts.SyntaxKind.ProtectedKeyword), dependencyCalls: uniqueCalls(calls), signalOperations });
   }
   const declaredProperties: PropertyInfo[] = declaration.members.filter(ts.isPropertyDeclaration).filter(member => ts.isIdentifier(member.name)).map(member => ({
-    name: (member.name as ts.Identifier).text, initializer: member.initializer?.getText(file), isPublic: !hasModifier(member, ts.SyntaxKind.PrivateKeyword) && !hasModifier(member, ts.SyntaxKind.ProtectedKeyword)
+    name: (member.name as ts.Identifier).text, initializer: member.initializer?.getText(file), isPublic: !hasModifier(member, ts.SyntaxKind.PrivateKeyword) && !hasModifier(member, ts.SyntaxKind.ProtectedKeyword),
+    signalInitialValue: signalInitialValue(member.initializer, file), formValues: formInitialValues(member.initializer, file)
   }));
   const parameterProperties: PropertyInfo[] = (constructor?.parameters ?? []).filter(parameter => ts.isIdentifier(parameter.name) &&
     Boolean(ts.getModifiers(parameter)?.some(modifier => [ts.SyntaxKind.PublicKeyword, ts.SyntaxKind.PrivateKeyword, ts.SyntaxKind.ProtectedKeyword, ts.SyntaxKind.ReadonlyKeyword].includes(modifier.kind)))).map(parameter => ({
@@ -68,6 +84,49 @@ export function analyzeSource(sourceFile: string, sourceCode: string, diagnostic
   const properties = [...declaredProperties, ...parameterProperties];
   for (const dependency of dependencies) { dependency.methods = [...new Set(dependency.methods)].sort(); dependency.observableMethods = [...new Set(dependency.observableMethods)].sort(); }
   return { diagnostic, sourceFile, sourceCode, entityType, className: declaration.name.text, standalone, dependencies, methods, properties, httpUsage };
+}
+
+function componentStandaloneSetting(decorator: ts.CallExpression | undefined, file: ts.SourceFile): boolean | undefined {
+  const metadata = decorator?.arguments[0];
+  if (!metadata || !ts.isObjectLiteralExpression(metadata)) return undefined;
+  const property = metadata.properties.find(item => ts.isPropertyAssignment(item) && item.name.getText(file) === 'standalone');
+  if (!property || !ts.isPropertyAssignment(property)) return undefined;
+  if (property.initializer.kind === ts.SyntaxKind.TrueKeyword) return true;
+  if (property.initializer.kind === ts.SyntaxKind.FalseKeyword) return false;
+  return undefined;
+}
+
+function usesStandaloneByDefault(diagnostic: ProjectDiagnostic): boolean {
+  const major = Number.parseInt(diagnostic.project.angularVersion?.match(/\d+/)?.[0] ?? '', 10);
+  return major >= 19 || diagnostic.project.primaryArchitecture === 'standalone';
+}
+
+function isBooleanToggle(expression: ts.Expression, file: ts.SourceFile): boolean {
+  if (!ts.isArrowFunction(expression) && !ts.isFunctionExpression(expression)) return false;
+  const parameter = expression.parameters[0]?.name.getText(file);
+  const body = ts.isBlock(expression.body) ? expression.body.statements.find(ts.isReturnStatement)?.expression : expression.body;
+  return Boolean(parameter && body && ts.isPrefixUnaryExpression(body) && body.operator === ts.SyntaxKind.ExclamationToken && body.operand.getText(file) === parameter);
+}
+
+function signalInitialValue(initializer: ts.Expression | undefined, file: ts.SourceFile): string | undefined {
+  if (!initializer || !ts.isCallExpression(initializer) || initializer.expression.getText(file) !== 'signal') return undefined;
+  return initializer.arguments[0]?.getText(file);
+}
+
+function formInitialValues(initializer: ts.Expression | undefined, file: ts.SourceFile): Record<string, string> | undefined {
+  if (!initializer || !ts.isCallExpression(initializer) || !/\.group$/.test(initializer.expression.getText(file))) return undefined;
+  const config = initializer.arguments[0];
+  if (!config || !ts.isObjectLiteralExpression(config)) return undefined;
+  const values: Record<string, string> = {};
+  for (const property of config.properties) {
+    if (!ts.isPropertyAssignment(property)) continue;
+    const name = property.name.getText(file).replace(/^['"]|['"]$/g, '');
+    const value = ts.isArrayLiteralExpression(property.initializer) ? property.initializer.elements[0] : property.initializer;
+    if (!value) continue;
+    const original = value.getText(file);
+    values[name] = /email/i.test(name) ? "'user@example.com'" : /password/i.test(name) ? "'password'" : original;
+  }
+  return Object.keys(values).length ? values : undefined;
 }
 
 function hasModifier(node: ts.Node, kind: ts.SyntaxKind): boolean { return Boolean(ts.canHaveModifiers(node) && ts.getModifiers(node)?.some(modifier => modifier.kind === kind)); }

@@ -45,10 +45,12 @@ export interface DependencyInfo {
 export interface MethodInfo {
   name: string;
   parameterCount: number;
+  parameterNames: string[];
   isPublic: boolean;
   dependencyCalls: Array<{ dependency: string; method: string; deferred: boolean }>;
+  signalOperations: Array<{ signal: string; operation: 'set' | 'toggle'; value?: string }>;
 }
-export interface PropertyInfo { name: string; initializer?: string; isPublic: boolean }
+export interface PropertyInfo { name: string; initializer?: string; isPublic: boolean; signalInitialValue?: string; formValues?: Record<string, string> }
 export interface HttpUsageInfo {
   methodName: string;
   httpMethod: string;
