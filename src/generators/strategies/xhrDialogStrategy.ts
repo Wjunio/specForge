@@ -1,0 +1,34 @@
+import { TestGenerationContext } from '../../types';
+import type { FrameworkSyntax } from '../testGenerator';
+import { GenerationStrategy } from './generationStrategy';
+
+export const xhrDialogStrategy: GenerationStrategy = {
+  id: 'xhr-dialog-download',
+  applies: context => context.xhrDownloadFlows.some(flow => Boolean(flow.dialogDependency)),
+  requiresRxjsOf: context => context.xhrDownloadFlows.some(flow => Boolean(flow.dialogDependency)),
+  append(lines, context, syntax) {
+    for (const flow of context.xhrDownloadFlows.filter(item => item.dialogDependency)) appendFlow(lines, flow, syntax);
+  }
+};
+
+function appendFlow(lines: string[], flow: TestGenerationContext['xhrDownloadFlows'][number], syntax: FrameworkSyntax): void {
+  const dialog = `${flow.dialogDependency}Mock`; const method = `subject.${flow.methodName}`;
+  const path = flow.path ?? ''; const httpMethod = flow.httpMethod ?? 'GET'; const successStatus = flow.successStatus ?? 200; const timeout = flow.timeoutMs ?? 0; const errorPrefix = flow.errorPrefix ?? '';
+  const fn = mockFunction(syntax);
+  const returnDialog = (result: boolean) => syntax.kind === 'jasmine' ? `${dialog}.open.and.returnValue({ afterClosed: () => of(${result}) });` : `${dialog}.open.mockReturnValue({ afterClosed: () => of(${result}) });`;
+  const xhrSpy = spyReturn(syntax, 'window as any', "'XMLHttpRequest'", 'xhr'); const errorMatcher = syntax.kind === 'jasmine' ? 'jasmine.any(Error)' : 'expect.any(Error)';
+  lines.push('', `  describe('${flow.methodName}', () => {`,
+    `    let xhr: { open: any; send: any; status: number; statusText: string; response: Blob | null; responseType: string; onprogress?: (event: any) => void; onload?: () => void; onerror?: () => void };`,
+    '', '    beforeEach(() => {', `      xhr = { open: ${fn}, send: ${fn}, status: 0, statusText: '', response: null, responseType: '' };`, '    });',
+    '', "    it('should stop when confirmation is cancelled', () => {", `      ${returnDialog(false)}`, `      ${method}(true);`, `      expect(${dialog}.open).toHaveBeenCalled();`, '      expect(xhr.send).not.toHaveBeenCalled();', '    });',
+    '', "    it('should start the XHR request and cover both progress branches', () => {", `      ${returnDialog(true)}`, `      ${xhrSpy}`, `      ${method}(true);`, `      expect(xhr.open).toHaveBeenCalledWith(${JSON.stringify(httpMethod)}, window.location.origin + ${JSON.stringify(path)}, true);`, "      expect(xhr.responseType).toBe('blob');", '      expect(xhr.send).toHaveBeenCalled();', '      xhr.onprogress!({ lengthComputable: true, loaded: 1, total: 4 });', ...(flow.progressProperty ? [`      expect(subject.${flow.progressProperty}).toBe(25);`] : []), '      xhr.onprogress!({ lengthComputable: false, loaded: 4, total: 4 });', ...(flow.progressProperty ? [`      expect(subject.${flow.progressProperty}).toBe(25);`] : []), '    });',
+    '', "    it('should create and clean up the downloaded link for the success status', () => {", `      ${returnDialog(true)}`, `      ${xhrSpy}`, `      ${syntax.timers.install}`, "      const anchor = document.createElement('a');", `      const click = ${spyPlain(syntax, 'anchor', "'click'")};`, `      ${spyReturn(syntax, 'document', "'createElement'", 'anchor')}`, `      ${spyReturn(syntax, 'window.URL', "'createObjectURL'", "'blob:download'")}`, `      const revoke = ${spyPlain(syntax, 'window.URL', "'revokeObjectURL'")};`, `      xhr.status = ${successStatus}; xhr.response = new Blob(['content']);`, `      ${method}(true);`, '      xhr.onload!();', ...(flow.downloadName ? [`      expect(anchor.download).toBe(${JSON.stringify(flow.downloadName)});`] : []), '      expect(click).toHaveBeenCalled();', "      expect(revoke).toHaveBeenCalledWith('blob:download');", ...(flow.loadingProperty ? [`      expect(subject.${flow.loadingProperty}).toBe(true);`] : []), `      ${syntax.timers.advance(timeout)}`, ...(flow.loadingProperty ? [`      expect(subject.${flow.loadingProperty}).toBe(false);`] : []), `      ${syntax.timers.uninstall}`, '    });',
+    '', "    it('should handle non-success and network failures', () => {", `      ${returnDialog(true)}`, `      ${xhrSpy}`, `      ${syntax.timers.install}`, `      const error = ${spyPlain(syntax, 'console', "'error'")};`, `      ${method}(true);`, "      xhr.status = 500; xhr.statusText = 'Server Error'; xhr.onload!();", `      expect(error).toHaveBeenCalledWith(${JSON.stringify(errorPrefix)}, 'Server Error');`, `      ${syntax.timers.advance(timeout)}`, ...(flow.loadingProperty ? [`      subject.${flow.loadingProperty} = true;`] : []), "      xhr.statusText = 'Network Error'; xhr.onerror!();", ...(flow.loadingProperty ? [`      expect(subject.${flow.loadingProperty}).toBe(false);`] : []), `      expect(error).toHaveBeenCalledWith(${JSON.stringify(errorPrefix)}, 'Network Error');`, `      ${syntax.timers.uninstall}`, '    });',
+    '', "    it('should catch a synchronous XMLHttpRequest failure', () => {", `      ${returnDialog(true)}`, `      ${xhrSpy}`, `      ${throwOnCall(syntax, 'xhr.open', "new Error('open failed')")}`, `      const error = ${spyPlain(syntax, 'console', "'error'")};`, `      ${method}(true);`, ...(flow.loadingProperty ? [`      expect(subject.${flow.loadingProperty}).toBe(false);`] : []), `      expect(error).toHaveBeenCalledWith(${JSON.stringify(errorPrefix)}, ${errorMatcher});`, '    });');
+  if (flow.redirectUrl) { const hrefSpy = syntax.kind === 'jasmine' ? "const href = spyOnProperty(window.location, 'href', 'set');" : `const href = ${syntax.kind === 'jest' ? 'jest' : 'vi'}.spyOn(window.location, 'href', 'set').mockImplementation(() => undefined);`; lines.push('', "    it('should cover the alternate redirect branch', () => {", `      ${returnDialog(true)}`, `      ${hrefSpy}`, `      ${method}(false);`, `      expect(href).toHaveBeenCalledWith(${JSON.stringify(flow.redirectUrl)});`, '    });'); }
+  lines.push('  });');
+}
+function mockFunction(syntax: FrameworkSyntax): string { return syntax.kind === 'jasmine' ? "jasmine.createSpy('fn')" : syntax.kind === 'jest' ? 'jest.fn()' : 'vi.fn()'; }
+function spyPlain(syntax: FrameworkSyntax, target: string, property: string): string { return syntax.kind === 'jasmine' ? `spyOn(${target}, ${property})` : `${syntax.kind === 'jest' ? 'jest' : 'vi'}.spyOn(${target}, ${property})`; }
+function spyReturn(syntax: FrameworkSyntax, target: string, property: string, value: string): string { const spy = spyPlain(syntax, target, property); return syntax.kind === 'jasmine' ? `${spy}.and.returnValue(${value} as any);` : `${spy}.mockReturnValue(${value} as any);`; }
+function throwOnCall(syntax: FrameworkSyntax, target: string, error: string): string { return syntax.kind === 'jasmine' ? `${target}.and.throwError(${error});` : `${target}.mockImplementation(() => { throw ${error}; });`; }

@@ -1,7 +1,10 @@
 import * as path from 'node:path';
 import { TestGenerationContext } from '../types';
+import { solveFlowScenarios } from '../analysis/controlFlowAnalyzer';
+import { registeredStrategies } from './strategies/strategyRegistry';
 
 export interface FrameworkSyntax {
+  kind: 'jasmine' | 'jest' | 'vitest';
   globalsImport?: string;
   mock(name: string, methods: string[], observableMethods: string[]): string;
   configureObservableMock?(name: string, method: string): string;
@@ -9,15 +12,19 @@ export interface FrameworkSyntax {
 }
 
 export function generateAngularTest(context: TestGenerationContext, syntax: FrameworkSyntax): string {
+  if (context.functional) return generateFunctionalTest(context, syntax);
   const relativeImport = `./${path.basename(context.sourceFile, '.ts')}`;
   const http = context.dependencies.some(item => item.type === 'HttpClient');
+  const modernHttp = http && angularMajor(context) >= 15;
+  const activeStrategies = registeredStrategies().filter(strategy => strategy.applies(context));
   const dependencies = context.dependencies.filter(item => item.type !== 'HttpClient' && item.type !== 'FormBuilder' && !item.optional);
   const lines: string[] = [];
   if (syntax.globalsImport) lines.push(syntax.globalsImport);
-  if (context.dependencies.some(item => item.type !== 'HttpClient' && item.observableMethods.length)) lines.push("import { of } from 'rxjs';");
+  if (context.dependencies.some(item => (item.type !== 'HttpClient' && item.observableMethods.length) || item.type === 'ActivatedRoute') || activeStrategies.some(strategy => strategy.requiresRxjsOf?.(context))) lines.push("import { of } from 'rxjs';");
   lines.push("import { TestBed } from '@angular/core/testing';");
   if (context.entityType === 'component') lines.push("import { ComponentFixture } from '@angular/core/testing';");
-  if (http) lines.push("import { HttpClientTestingModule, HttpTestingController } from '@angular/common/http/testing';");
+  if (http && modernHttp) lines.push("import { provideHttpClient } from '@angular/common/http';", "import { HttpTestingController, provideHttpClientTesting } from '@angular/common/http/testing';");
+  else if (http) lines.push("import { HttpClientTestingModule, HttpTestingController } from '@angular/common/http/testing';");
   for (const dependency of dependencies.filter(item => item.importPath)) lines.push(`import { ${dependency.providerToken} } from '${dependency.importPath}';`);
   lines.push(`import { ${context.className} } from '${relativeImport}';`, '', `describe('${context.className}', () => {`);
   if (context.entityType === 'component') lines.push(`  let fixture: ComponentFixture<${context.className}>;`, `  let subject: ${context.className};`);
@@ -28,15 +35,17 @@ export function generateAngularTest(context: TestGenerationContext, syntax: Fram
   for (const dependency of dependencies) {
     lines.push(`    ${dependency.name}Mock = ${syntax.mock(dependency.name, dependency.methods, dependency.observableMethods)};`);
     if (syntax.configureObservableMock) for (const method of dependency.observableMethods) lines.push(`    ${syntax.configureObservableMock(dependency.name, method)}`);
-    if (dependency.type === 'ActivatedRoute') lines.push(`    ${dependency.name}Mock.snapshot = { queryParamMap: { get: () => null } };`);
+    if (dependency.type === 'ActivatedRoute') lines.push(`    ${dependency.name}Mock.snapshot = { paramMap: { get: () => null }, queryParamMap: { get: () => null }, params: {}, queryParams: {}, data: {} };`, `    ${dependency.name}Mock.params = of({});`, `    ${dependency.name}Mock.queryParams = of({});`, `    ${dependency.name}Mock.data = of({});`);
   }
-  const providers = [`${context.className}`, ...dependencies.map(item => `{ provide: ${item.providerToken}, useValue: ${item.name}Mock }`)].join(', ');
+  const httpProviders = modernHttp ? ['provideHttpClient()', 'provideHttpClientTesting()'] : [];
+  const providers = [`${context.className}`, ...dependencies.map(item => `{ provide: ${item.providerToken}, useValue: ${item.name}Mock }`), ...httpProviders].join(', ');
   if (context.entityType === 'component') {
-    const setup = context.standalone ? `imports: [${context.className}${http ? ', HttpClientTestingModule' : ''}], providers: [${dependencies.map(item => `{ provide: ${item.providerToken}, useValue: ${item.name}Mock }`).join(', ')}]`
-      : `declarations: [${context.className}], imports: [${http ? 'HttpClientTestingModule' : ''}], providers: [${dependencies.map(item => `{ provide: ${item.providerToken}, useValue: ${item.name}Mock }`).join(', ')}]`;
-    lines.push(`    await TestBed.configureTestingModule({ ${setup} }).compileComponents();`, `    fixture = TestBed.createComponent(${context.className});`, '    subject = fixture.componentInstance;');
+    const componentProviders = [...dependencies.map(item => `{ provide: ${item.providerToken}, useValue: ${item.name}Mock }`), ...httpProviders].join(', ');
+    const setup = context.standalone ? `imports: [${context.className}${http && !modernHttp ? ', HttpClientTestingModule' : ''}], providers: [${componentProviders}]`
+      : `declarations: [${context.className}], imports: [${http && !modernHttp ? 'HttpClientTestingModule' : ''}], providers: [${componentProviders}]`;
+    lines.push(`    await TestBed.configureTestingModule({ ${setup} }).compileComponents();`, `    fixture = TestBed.createComponent(${context.className});`, '    subject = fixture.componentInstance;', '    fixture.detectChanges();');
   } else {
-    lines.push(`    await TestBed.configureTestingModule({ imports: [${http ? 'HttpClientTestingModule' : ''}], providers: [${providers}] }).compileComponents();`, `    subject = TestBed.inject(${context.className});`);
+    lines.push(`    await TestBed.configureTestingModule({ imports: [${http && !modernHttp ? 'HttpClientTestingModule' : ''}], providers: [${providers}] }).compileComponents();`, `    subject = TestBed.inject(${context.className});`);
   }
   if (http) lines.push('    httpMock = TestBed.inject(HttpTestingController);');
   lines.push('  });');
@@ -57,14 +66,8 @@ export function generateAngularTest(context: TestGenerationContext, syntax: Fram
   for (const usage of context.httpUsage) {
     const url = preferredUrl(usage.urls);
     if (!url) continue;
-    lines.push('', `  it('should perform ${usage.httpMethod} ${url} when ${usage.methodName} is called', () => {`, `    subject.${usage.methodName}()${usage.subscribesInternally ? ';' : '.subscribe();'}`, `    const request = httpMock.expectOne('${escapeQuote(url)}');`, `    expect(request.request.method).toBe('${usage.httpMethod}');`, '    request.flush([]);', '  });');
-    if (usage.subscribesInternally && context.properties.some(property => property.name === 'status')) {
-      lines.push('', `  it('should expose the error state when ${usage.methodName} fails', () => {`, `    subject.${usage.methodName}();`, `    const request = httpMock.expectOne('${escapeQuote(url)}');`, "    request.flush('failure', { status: 500, statusText: 'Server Error' });", "    expect(subject.status).toBe('error');", '  });');
-    }
-    if (usage.subscribesInternally && context.properties.some(property => property.name === 'apiUrl') && usage.urls.some(candidate => candidate !== url)) {
-      const suffix = [...usage.urls].sort((left, right) => left.length - right.length)[0];
-      lines.push('', `  it('should use the configured API URL when ${usage.methodName} is called', () => {`, "    subject.apiUrl = 'https://example.test';", `    subject.${usage.methodName}();`, `    const request = httpMock.expectOne('https://example.test${escapeQuote(suffix)}');`, `    expect(request.request.method).toBe('${usage.httpMethod}');`, '    request.flush([]);', '  });');
-    }
+    lines.push('', `  it('should perform ${usage.httpMethod} ${url} when ${usage.methodName} succeeds', () => {`, `    subject.${usage.methodName}()${usage.subscribesInternally ? ';' : '.subscribe();'}`, `    const request = httpMock.expectOne('${escapeQuote(url)}');`, `    expect(request.request.method).toBe('${usage.httpMethod}');`, `    request.flush(${usage.mockResponse});`, '  });');
+    if (!usage.subscribesInternally || usage.handlesError) lines.push('', `  it('should exercise the error path when ${usage.methodName} fails', () => {`, `    subject.${usage.methodName}()${usage.subscribesInternally ? ';' : '.subscribe({ error: () => undefined });'}`, `    const request = httpMock.expectOne('${escapeQuote(url)}');`, "    request.flush('Server Error', { status: 500, statusText: 'Internal Server Error' });", '  });');
   }
   const httpMethods = new Set(context.httpUsage.map(item => item.methodName));
   for (const method of context.methods.filter(item => item.isPublic && item.parameterCount === 0 && item.dependencyCalls.some(call => !call.deferred) && !httpMethods.has(item.name))) {
@@ -75,14 +78,131 @@ export function generateAngularTest(context: TestGenerationContext, syntax: Fram
     lines.push('  });');
   }
   appendSignalScenarios(lines, context);
-  appendKnownBehaviorScenarios(lines, context, syntax);
+  appendComputedScenarios(lines, context);
+  appendEffectScenarios(lines, context);
+  appendLifecycleScenarios(lines, context);
+  appendTemplateEntryScenarios(lines, context);
+  appendControlFlowScenarios(lines, context);
+  for (const strategy of activeStrategies) strategy.append(lines, context, syntax);
   lines.push('});', '');
   return lines.join('\n');
 }
 
+function appendTemplateEntryScenarios(lines: string[], context: TestGenerationContext): void {
+  if (!context.templateUsage) return;
+  for (const name of context.templateUsage.invokedMethods) {
+    const method = context.methods.find(item => item.name === name && item.isPublic && item.dependencyCalls.length);
+    if (!method) continue;
+    const flow = context.controlFlow.find(item => item.methodName === name);
+    const argumentsList = flow?.parameters.map(parameter => parameter.candidates[0] ?? 'undefined') ?? method.parameterNames.map(() => 'undefined');
+    lines.push('', `  it('should execute template event handler ${name}', () => {`, `    (subject as any).${name}(${argumentsList.join(', ')});`);
+    for (const call of method.dependencyCalls.filter(item => context.dependencies.some(dependency => dependency.name === item.dependency))) lines.push(`    expect(${call.dependency}Mock.${call.method}).toHaveBeenCalled();`);
+    lines.push('  });');
+  }
+}
+
+function appendComputedScenarios(lines: string[], context: TestGenerationContext): void {
+  for (const computed of context.properties.filter(property => property.isPublic && property.computedExpression && property.computedDependencies?.length)) {
+    const dependencies = computed.computedDependencies!.map(name => context.properties.find(property => property.name === name && property.signalInitialValue !== undefined)).filter((property): property is NonNullable<typeof property> => Boolean(property));
+    const mutable = dependencies.find(property => alternateLiteral(property.signalInitialValue!) !== undefined);
+    if (!mutable) continue;
+    const alternate = alternateLiteral(mutable.signalInitialValue!)!;
+    const expected = computed.computedExpression!.replace(/\bthis\.([$\w]+)\s*\(\s*\)/g, 'subject.$1()');
+    lines.push('', `  it('should recompute ${computed.name} when ${mutable.name} changes', () => {`, `    subject.${mutable.name}.set(${alternate});`);
+    if (context.entityType === 'component') lines.push('    fixture.detectChanges();');
+    lines.push(`    expect(subject.${computed.name}()).toEqual(${expected});`, '  });');
+  }
+}
+
+function appendEffectScenarios(lines: string[], context: TestGenerationContext): void {
+  for (const effect of context.properties.filter(property => property.effectDependencies?.length && property.effectWrites?.length)) {
+    const mutable = effect.effectDependencies!
+      .map(name => context.properties.find(property => property.name === name && property.signalInitialValue !== undefined))
+      .find((property): property is NonNullable<typeof property> => Boolean(property && alternateLiteral(property.signalInitialValue!) !== undefined));
+    if (!mutable) continue;
+    const alternate = alternateLiteral(mutable.signalInitialValue!)!;
+    lines.push('', `  it('should run ${effect.name} when ${mutable.name} changes', () => {`, `    subject.${mutable.name}.set(${alternate});`);
+    if (context.entityType === 'component') lines.push('    fixture.detectChanges();');
+    for (const write of effect.effectWrites!) {
+      const expected = write.expression.replace(/\bthis\.([$\w]+)\s*\(\s*\)/g, 'subject.$1()');
+      lines.push(`    expect((subject as any).${write.property}).toEqual(${expected});`);
+    }
+    lines.push('  });');
+  }
+}
+
+function generateFunctionalTest(context: TestGenerationContext, syntax: FrameworkSyntax): string {
+  const relativeImport = `./${path.basename(context.sourceFile, '.ts')}`;
+  const lines: string[] = [];
+  if (syntax.globalsImport) lines.push(syntax.globalsImport);
+  const needsOf = context.entityType === 'functional-interceptor' || context.dependencies.some(dependency => dependency.observableMethods.length);
+  if (needsOf) lines.push("import { of } from 'rxjs';");
+  lines.push("import { TestBed } from '@angular/core/testing';");
+  for (const dependency of context.dependencies.filter(item => item.importPath)) lines.push(`import { ${dependency.providerToken} } from '${dependency.importPath}';`);
+  lines.push(`import { ${context.className} } from '${relativeImport}';`, '', `describe('${context.className}', () => {`);
+  for (const dependency of context.dependencies) lines.push(`  let ${dependency.name}Mock: any;`);
+  lines.push('', '  beforeEach(() => {');
+  for (const dependency of context.dependencies) {
+    lines.push(`    ${dependency.name}Mock = ${syntax.mock(dependency.name, dependency.methods, dependency.observableMethods)};`);
+    if (syntax.configureObservableMock) for (const method of dependency.observableMethods) lines.push(`    ${syntax.configureObservableMock(dependency.name, method)}`);
+  }
+  lines.push(`    TestBed.configureTestingModule({ providers: [${context.dependencies.map(item => `{ provide: ${item.providerToken}, useValue: ${item.name}Mock }`).join(', ')}] });`, '  });');
+  if (context.entityType === 'functional-interceptor') {
+    const fn = mockFunction(syntax);
+    const nextName = context.methods[0].parameterNames[1];
+    const callsNext = Boolean(nextName && new RegExp(`\\b${escapeRegExp(nextName)}\\s*\\(`).test(context.sourceCode));
+    lines.push('', "  it('should execute the functional interceptor in an injection context', () => {", '    const request = {} as any;', `    const next = ${fn};`, syntax.kind === 'jasmine' ? '    next.and.returnValue(of({} as any));' : '    next.mockReturnValue(of({} as any));', `    TestBed.runInInjectionContext(() => ${context.className}(request, next));`);
+    if (callsNext) lines.push('    expect(next).toHaveBeenCalled();');
+    for (const dependency of context.dependencies) for (const method of dependency.methods) lines.push(`    expect(${dependency.name}Mock.${method}).toHaveBeenCalled();`);
+    lines.push('  });');
+  } else {
+    const argumentsList = context.methods[0].parameterNames.map(() => '{} as any').join(', ');
+    lines.push('', "  it('should execute the functional Angular entrypoint in an injection context', () => {", `    TestBed.runInInjectionContext(() => ${context.className}(${argumentsList}));`);
+    for (const dependency of context.dependencies) for (const method of dependency.methods) lines.push(`    expect(${dependency.name}Mock.${method}).toHaveBeenCalled();`);
+    lines.push('  });');
+  }
+  lines.push('});', '');
+  return lines.join('\n');
+}
+
+function angularMajor(context: TestGenerationContext): number { return Number.parseInt(context.diagnostic.project.angularVersion?.match(/\d+/)?.[0] ?? '0', 10); }
+function escapeRegExp(value: string): string { return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+function mockFunction(syntax: FrameworkSyntax): string { return syntax.kind === 'jasmine' ? "jasmine.createSpy('fn')" : syntax.kind === 'jest' ? 'jest.fn()' : 'vi.fn()'; }
+
+function appendLifecycleScenarios(lines: string[], context: TestGenerationContext): void {
+  for (const lifecycle of context.lifecycles) {
+    const argumentsList = lifecycle === 'ngOnChanges' ? '{} as any' : '';
+    lines.push('', `  it('should execute ${lifecycle} lifecycle hook', () => {`, `    subject.${lifecycle}(${argumentsList});`, '  });');
+  }
+}
+
+function appendControlFlowScenarios(lines: string[], context: TestGenerationContext): void {
+  const specialized = new Set([...context.xhrDownloadFlows.map(flow => flow.methodName), ...context.httpUsage.map(usage => usage.methodName)]);
+  const publicMethods = new Set(context.methods.filter(method => method.isPublic).map(method => method.name));
+  for (const flow of context.controlFlow.filter(method => method.decisions.length && method.effects.some(effect => effect.kind === 'property-write' || effect.kind === 'return') && publicMethods.has(method.methodName) && !specialized.has(method.methodName))) {
+    lines.push('', `  describe('${flow.methodName} control-flow paths', () => {`);
+    const scenarios = solveFlowScenarios(flow);
+    scenarios.forEach((scenario, index) => {
+      const argumentsList = scenario.arguments;
+      const invocation = `(subject as any).${flow.methodName}(${argumentsList.join(', ')})`;
+      const returns = scenario.effects.find(effect => effect.kind === 'return');
+      lines.push('', `    it('should exercise resolved path ${index + 1} of ${scenarios.length}', ${flow.async ? 'async ' : ''}() => {`,
+        `      const result = ${flow.async ? `await ${invocation}` : invocation};`);
+      for (const effect of scenario.effects) {
+        if (effect.kind !== 'property-write') continue;
+        lines.push(`      expect(subject.${effect.property}).toEqual(${effect.values[0]});`);
+      }
+      if (returns?.kind === 'return') lines.push(`      expect(result).toEqual(${returns.values[0]});`);
+      for (const effect of scenario.effects) if (effect.kind === 'dependency-call' && context.dependencies.some(dependency => dependency.name === effect.dependency)) lines.push(`      expect(${effect.dependency}Mock.${effect.method}).toHaveBeenCalled();`);
+      lines.push('    });');
+    });
+    lines.push('  });');
+  }
+}
+
 function appendValidFormSetup(lines: string[], context: TestGenerationContext, methodName: string, indentation: string): void {
   const method = context.methods.find(item => item.name === methodName);
-  if (!method || !/login|submit|save/i.test(methodName)) return;
+  if (!method) return;
   const form = context.properties.find(property => property.formValues);
   if (!form?.formValues) return;
   const values = Object.entries(form.formValues).map(([name, value]) => `${name}: ${value}`).join(', ');
@@ -132,19 +252,3 @@ function isStableLiteral(value?: string): boolean { return Boolean(value && /^(?
 function escapeQuote(value: string): string { return value.replace(/\\/g, '\\\\').replace(/'/g, "\\'"); }
 function preferredUrl(urls: string[]): string | undefined { return [...urls].sort((left, right) => right.length - left.length)[0]; }
 
-function appendKnownBehaviorScenarios(lines: string[], context: TestGenerationContext, syntax: FrameworkSyntax): void {
-  const methods = new Set(context.methods.map(method => method.name));
-  const properties = new Set(context.properties.map(property => property.name));
-  if (methods.has('evaluateStatus') && properties.has('status')) {
-    lines.push('', "  it('should evaluate every item-count status boundary', () => {", "    const scenarios = [[0, 'idle'], [1, 'loading'], [4, 'loading'], [5, 'success'], [-1, 'error']] as const;", '    for (const [count, expected] of scenarios) {', '      subject.evaluateStatus(count);', '      expect(subject.status).toBe(expected);', '    }', '  });');
-  }
-  if (methods.has('recalculateSummary') && properties.has('items') && properties.has('summary')) {
-    lines.push('', "  it('should recalculate active values, count, and category totals', () => {", "    subject.items = [", "      { id: 1, name: 'A', value: 10, category: 'one', active: true },", "      { id: 2, name: 'B', value: 5, category: 'one', active: false },", "      { id: 3, name: 'C', value: 7, category: '', active: true }", '    ];', '    subject.recalculateSummary();', "    expect(subject.summary).toEqual({ totalValue: 17, activeCount: 2, categoryTotals: { one: 15, uncategorized: 7 } });", '  });');
-  }
-  if (methods.has('processBatchUpdate') && properties.has('items') && properties.has('summary')) {
-    lines.push('', "  it('should activate, toggle, or deactivate items around the batch threshold', () => {", "    subject.items = [", "      { id: 1, name: 'above', value: 11, category: 'x', active: false },", "      { id: 2, name: 'equal', value: 10, category: 'x', active: true },", "      { id: 3, name: 'below', value: 9, category: 'x', active: true }", '    ];', '    subject.processBatchUpdate(10);', '    expect(subject.items.map(item => item.active)).toEqual([true, false, false]);', '    expect(subject.summary.activeCount).toBe(1);', '  });');
-  }
-  if (methods.has('initTimer') && properties.has('counter') && properties.has('status')) {
-    lines.push('', "  it('should update the counter only after a successful timer tick', () => {", `    ${syntax.timers.install}`, "    subject.status = 'success';", '    subject.initTimer();', `    ${syntax.timers.advance(1000)}`, '    expect(subject.counter).toBe(10);', `    ${syntax.timers.uninstall}`, '  });');
-  }
-}

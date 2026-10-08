@@ -1,7 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { analyzeSource } from '../analysis/sourceAnalyzer';
+import { componentTemplateReference, inspectTemplateAst } from '../analysis/templateAnalyzer';
 import { resolveTestCommand } from '../execution/commandResolver';
+import { parseCoverageDetail, parseCoverageSummary } from '../execution/coverageReader';
+import { repairGeneratedTest } from '../generation/repairPlanner';
+import { augmentTestForCoverage } from '../generation/coverageFeedback';
 import { JasmineKarmaAdapter } from '../testing/jasmineKarmaAdapter';
 import { JestAdapter } from '../testing/jestAdapter';
 import { parseTestResult } from '../testing/testResultParser';
@@ -43,8 +47,19 @@ test('generates an Angular HTTP service test from actual AST usage', () => {
   const source = `@Injectable() export class UserService { constructor(private http: HttpClient) {} getUsers() { return this.http.get('/api/users'); } }`;
   const context = analyzeSource('C:/workspace/user.service.ts', source, diagnostic(TestFramework.Jest, TestRunner.Jest));
   const spec = new JestAdapter().generateServiceTest(context);
-  assert.equal(context.entityType, 'service'); assert.deepEqual(context.httpUsage[0], { methodName: 'getUsers', httpMethod: 'GET', urls: ['/api/users'], subscribesInternally: false });
-  assert.match(spec, /HttpClientTestingModule/); assert.match(spec, /httpMock\.expectOne\('\/api\/users'\)/); assert.match(spec, /request\.request\.method/);
+  assert.equal(context.entityType, 'service'); assert.deepEqual(context.httpUsage[0], { methodName: 'getUsers', httpMethod: 'GET', urls: ['/api/users'], subscribesInternally: false, handlesError: false, mockResponse: '[]' });
+  assert.match(spec, /HttpClientTestingModule/); assert.match(spec, /httpMock\.expectOne\('\/api\/users'\)/); assert.match(spec, /request\.request\.method/); assert.match(spec, /exercise the error path/);
+});
+
+test('uses provider-based HTTP testing for modern Angular versions', () => {
+  const project = diagnostic(TestFramework.Jest, TestRunner.Jest);
+  project.project.angularVersion = '19.2.0';
+  const context = analyzeSource('C:/workspace/user.service.ts', `@Injectable() export class UserService { constructor(private http: HttpClient) {} load() { return this.http.get<boolean>('/ready'); } }`, project);
+  const spec = new JestAdapter().generateServiceTest(context);
+  assert.match(spec, /provideHttpClient\(\)/);
+  assert.match(spec, /provideHttpClientTesting\(\)/);
+  assert.doesNotMatch(spec, /HttpClientTestingModule/);
+  assert.match(spec, /request\.flush\(true\)/);
 });
 
 test('configures observable dependency mocks for subscribe-based component behavior', () => {
@@ -96,6 +111,48 @@ test('supports inject fields, implicit standalone components, signals, and react
   assert.match(spec, /should update signal state when dismissErrorMessage is called/);
 });
 
+test('extracts computed signal dependencies and generates a reactive assertion', () => {
+  const source = `@Component({ standalone: true, template: '' }) export class PriceComponent { quantity = signal(2); unitPrice = signal(5); total = computed(() => this.quantity() * this.unitPrice()); }`;
+  const context = analyzeSource('C:/workspace/price.component.ts', source, diagnostic(TestFramework.Jest, TestRunner.Jest));
+  const total = context.properties.find(item => item.name === 'total')!;
+  assert.equal(total.computedExpression, 'this.quantity() * this.unitPrice()');
+  assert.deepEqual(total.computedDependencies, ['quantity', 'unitPrice']);
+  const spec = new JestAdapter().generateComponentTest(context);
+  assert.match(spec, /subject\.quantity\.set\(0\)/);
+  assert.match(spec, /fixture\.detectChanges\(\)/);
+  assert.match(spec, /expect\(subject\.total\(\)\)\.toEqual\(subject\.quantity\(\) \* subject\.unitPrice\(\)\)/);
+});
+
+test('extracts signal effects, observable writes, and cleanup registration', () => {
+  const source = `@Component({ standalone: true, template: '' }) export class CounterComponent { count = signal(0); visible = 0; sync = effect((onCleanup) => { this.visible = this.count(); onCleanup(() => this.visible = -1); }); }`;
+  const context = analyzeSource('C:/workspace/counter.component.ts', source, diagnostic(TestFramework.Jest, TestRunner.Jest));
+  const effect = context.properties.find(property => property.name === 'sync')!;
+  assert.deepEqual(effect.effectDependencies, ['count']);
+  assert.equal(effect.effectHasCleanup, true);
+  assert.ok(effect.effectWrites?.some(write => write.property === 'visible' && write.expression === 'this.count()'));
+  const generated = new JestAdapter().generateComponentTest(context);
+  assert.match(generated, /should run sync when count changes/);
+  assert.match(generated, /expect\(\(subject as any\)\.visible\)\.toEqual\(subject\.count\(\)\)/);
+});
+
+test('extracts inline and external templates and inspects Angular template AST metadata', () => {
+  const inline = componentTemplateReference('C:/workspace/card.component.ts', `@Component({ template: '<button (click)="save()">Save</button>' }) export class CardComponent {}`);
+  assert.equal(inline.inline, '<button (click)="save()">Save</button>');
+  const external = componentTemplateReference('C:/workspace/card.component.ts', `@Component({ templateUrl: './card.component.html' }) export class CardComponent {}`);
+  assert.match(external.external!, /card\.component\.html$/);
+  class PropertyRead { constructor(public name: string) {} }
+  class Call { constructor(public receiver: unknown) {} }
+  class BoundEvent { constructor(public name: string, public handler: unknown) {} }
+  class BoundAttribute { constructor(public name: string) {} }
+  class TextAttribute { constructor(public name: string, public value: string) {} }
+  const usage = inspectTemplateAst([new BoundEvent('click', new Call(new PropertyRead('save'))), new BoundAttribute('disabled'), new TextAttribute('formControlName', 'email')]);
+  assert.deepEqual(usage, { events: ['click'], invokedMethods: ['save'], inputs: ['disabled'], outputs: ['click'], formControls: ['email'] });
+  const source = `import { SaveService } from './save.service'; @Component({ standalone: true, template: '' }) export class FormComponent { constructor(private saver: SaveService) {} submit() { this.saver.save(); } }`;
+  const context = analyzeSource('C:/workspace/form.component.ts', source, diagnostic(TestFramework.Jest, TestRunner.Jest));
+  context.templateUsage = { events: ['submit'], invokedMethods: ['submit'], inputs: [], outputs: ['submit'], formControls: [] };
+  assert.match(new JestAdapter().generateComponentTest(context), /should execute template event handler submit/);
+});
+
 test('respects an explicit standalone false setting', () => {
   const source = `@Component({ standalone: false, template: '' }) export class LegacyComponent {}`;
   const context = analyzeSource('C:/workspace/legacy.component.ts', source, diagnostic(TestFramework.Jest, TestRunner.Jest));
@@ -103,8 +160,58 @@ test('respects an explicit standalone false setting', () => {
   assert.match(new JestAdapter().generateComponentTest(context), /declarations: \[LegacyComponent\]/);
 });
 
+test('extracts and generates lifecycle hook scenarios', () => {
+  const source = `@Component({ standalone: true, template: '' }) export class LifecycleComponent { ngOnInit() {} ngOnChanges(_changes: any) {} ngOnDestroy() {} }`;
+  const context = analyzeSource('C:/workspace/lifecycle.component.ts', source, diagnostic(TestFramework.Jest, TestRunner.Jest));
+  const spec = new JestAdapter().generateComponentTest(context);
+  assert.deepEqual(context.lifecycles, ['ngOnInit', 'ngOnChanges', 'ngOnDestroy']);
+  assert.match(spec, /subject\.ngOnInit\(\)/);
+  assert.match(spec, /subject\.ngOnChanges\(\{\} as any\)/);
+  assert.match(spec, /subject\.ngOnDestroy\(\)/);
+});
+
 test('rejects unsupported entity types', () => {
-  assert.throws(() => analyzeSource('thing.pipe.ts', 'export class ThingPipe {}', diagnostic(TestFramework.Jest, TestRunner.Jest)), /somente Component e Service/);
+  assert.throws(() => analyzeSource('thing.directive.ts', 'export class ThingDirective {}', diagnostic(TestFramework.Jest, TestRunner.Jest)), /Component, Service, Pipe ou Guard/);
+});
+
+test('supports class-based pipes and guards', () => {
+  const pipe = analyzeSource('label.pipe.ts', `@Pipe({ name: 'label' }) export class LabelPipe { transform(value: string) { return value ? value.trim() : ''; } }`, diagnostic(TestFramework.Jest, TestRunner.Jest));
+  const guard = analyzeSource('auth.guard.ts', `@Injectable() export class AuthGuard { canActivate(enabled: boolean) { return enabled ? true : false; } }`, diagnostic(TestFramework.Jest, TestRunner.Jest));
+  assert.equal(pipe.entityType, 'pipe'); assert.equal(guard.entityType, 'guard');
+  assert.equal(pipe.controlFlow[0].decisions[0].kind, 'ternary');
+  assert.equal(guard.controlFlow[0].decisions[0].kind, 'ternary');
+});
+
+test('supports functional guards, resolvers, and interceptors through injection context', () => {
+  const project = diagnostic(TestFramework.Jest, TestRunner.Jest);
+  const guardSource = `import { inject } from '@angular/core'; import { CanActivateFn } from '@angular/router'; import { AuthService } from './auth.service'; export const authGuard: CanActivateFn = () => { const auth = inject(AuthService); return auth.allowed(); };`;
+  const guard = analyzeSource('C:/workspace/auth.guard.ts', guardSource, project);
+  const guardSpec = new JestAdapter().generateServiceTest(guard);
+  assert.equal(guard.entityType, 'functional-guard'); assert.equal(guard.functional, true);
+  assert.match(guardSpec, /TestBed\.runInInjectionContext\(\(\) => authGuard\(\)\)/);
+  assert.match(guardSpec, /expect\(authMock\.allowed\)\.toHaveBeenCalled\(\)/);
+
+  const interceptorSource = `import { HttpInterceptorFn } from '@angular/common/http'; export const traceInterceptor: HttpInterceptorFn = (request, next) => next(request);`;
+  const interceptor = analyzeSource('C:/workspace/trace.interceptor.ts', interceptorSource, project);
+  const interceptorSpec = new JestAdapter().generateServiceTest(interceptor);
+  assert.equal(interceptor.entityType, 'functional-interceptor');
+  assert.match(interceptorSpec, /traceInterceptor\(request, next\)/);
+  assert.match(interceptorSpec, /expect\(next\)\.toHaveBeenCalled\(\)/);
+
+  const resolverSource = `import { ResolveFn } from '@angular/router'; export const itemResolver: ResolveFn<string> = () => 'item';`;
+  const resolver = analyzeSource('C:/workspace/item.resolver.ts', resolverSource, project);
+  assert.equal(resolver.entityType, 'functional-resolver');
+
+  for (const adapter of [new JasmineKarmaAdapter(), new JestAdapter(), new VitestAdapter()]) {
+    const generatedGuard = adapter.generateServiceTest(guard);
+    const generatedInterceptor = adapter.generateServiceTest(interceptor);
+    const generatedResolver = adapter.generateServiceTest(resolver);
+    assert.match(generatedGuard, /TestBed\.runInInjectionContext/);
+    assert.match(generatedInterceptor, /traceInterceptor\(request, next\)/);
+    assert.match(generatedInterceptor, /import \{ of \} from 'rxjs'/);
+    assert.match(generatedInterceptor, /returnValue\(of|mockReturnValue\(of/);
+    assert.match(generatedResolver, /itemResolver\(\)/);
+  }
 });
 
 test('resolves only local runner entrypoints and rejects paths outside workspace', () => {
@@ -116,6 +223,21 @@ test('resolves only local runner entrypoints and rejects paths outside workspace
   assert.match(vitest.args[0], /vitest\.mjs$/); assert.deepEqual(vitest.args.slice(-2), ['-t', 'emits user']);
   const karma = resolveTestCommand('C:/workspace', TestRunner.Karma, 'C:/workspace/src/user.spec.ts');
   assert.match(karma.args[0], /@angular[\\/]cli[\\/]bin[\\/]ng\.js$/); assert.ok(karma.args.includes('--include'));
+});
+
+test('adds runner coverage flags and parses source-specific coverage summaries', () => {
+  const jest = resolveTestCommand('C:/workspace', TestRunner.Jest, 'C:/workspace/src/user.spec.ts', undefined, { coverage: true, sourceFile: 'C:/workspace/src/user.ts' });
+  assert.ok(jest.args.includes('--coverage')); assert.ok(jest.args.includes('--coverageReporters=json-summary')); assert.ok(jest.args.includes('--collectCoverageFrom=src/user.ts'));
+  const vitest = resolveTestCommand('C:/workspace', TestRunner.Vitest, 'C:/workspace/src/user.spec.ts', undefined, { coverage: true });
+  assert.ok(vitest.args.includes('--coverage')); assert.ok(vitest.args.includes('--coverage.reporter=json-summary'));
+  const karma = resolveTestCommand('C:/workspace', TestRunner.Karma, 'C:/workspace/src/user.spec.ts', undefined, { coverage: true });
+  assert.ok(karma.args.includes('--code-coverage'));
+  const summary = parseCoverageSummary(JSON.stringify({ total: {}, 'C:/workspace/src/user.ts': { statements: { pct: 100 }, branches: { pct: 75 }, functions: { pct: 80 }, lines: { pct: 90 } } }), 'C:/workspace/src/user.ts');
+  assert.deepEqual(summary, { statements: 100, branches: 75, functions: 80, lines: 90, sourceFile: 'C:/workspace/src/user.ts' });
+  const detail = parseCoverageDetail(JSON.stringify({ 'C:/workspace/src/user.ts': { statementMap: { '0': { start: { line: 2 } }, '1': { start: { line: 5 } } }, s: { '0': 1, '1': 0 }, fnMap: { '0': { name: 'load', loc: { start: { line: 4 } } } }, f: { '0': 0 }, branchMap: { '0': { loc: { start: { line: 7 } } } }, b: { '0': [1, 0] } } }), 'C:/workspace/src/user.ts');
+  assert.deepEqual(detail?.uncoveredLines, [5]);
+  assert.deepEqual(detail?.uncoveredFunctions, [{ name: 'load', line: 4 }]);
+  assert.deepEqual(detail?.uncoveredBranches, [{ line: 7, indexes: [1] }]);
 });
 
 test('generates NgModule service setup and exercises adapter service entrypoints', () => {
@@ -136,6 +258,30 @@ test('classifies compilation, runtime, assertion, and environment failures', () 
   assert.equal(environment.runtimeErrors[0].kind, 'environment');
   const passed = parseTestResult('Tests: 2 passed, 1 skipped', 0, 'node jest', 10);
   assert.equal(passed.success, true); assert.equal(passed.passed, 2);
+});
+
+test('plans deterministic repairs for missing mock methods and imported providers', () => {
+  const jestSource = `import { ExtraService } from './extra';\nserviceMock = { load: jest.fn() };\nTestBed.configureTestingModule({ providers: [] });`;
+  const repaired = repairGeneratedTest(jestSource, `TypeError: serviceMock.save is not a function\nNullInjectorError: No provider for ExtraService!`, TestFramework.Jest)!;
+  assert.match(repaired.content, /serviceMock = \{ save: jest\.fn\(\), load:/);
+  assert.match(repaired.content, /providers: \[\{ provide: ExtraService, useValue: \{\} \}/);
+  assert.deepEqual(repaired.reasons, ['added serviceMock.save', 'added provider ExtraService']);
+  const jasmineSource = `serviceMock = jasmine.createSpyObj('service', ['load']);`;
+  assert.match(repairGeneratedTest(jasmineSource, 'serviceMock.save is not a function', TestFramework.Jasmine)!.content, /\['load', 'save'\]/);
+});
+
+test('feeds uncovered Istanbul locations back into CFG scenarios without application-name rules', () => {
+  const source = `@Injectable() export class RatingService { classify(score: number) { if (score >= 10) return 'high'; return 'low'; } }`;
+  const context = analyzeSource('C:/workspace/rating.service.ts', source, diagnostic(TestFramework.Jest, TestRunner.Jest));
+  const initial = new JestAdapter().generateServiceTest(context).replace(/\n  describe\('classify control-flow paths'[\s\S]*?\n  \}\);\n/, '\n');
+  const line = context.controlFlow.find(flow => flow.methodName === 'classify')!.startLine;
+  const feedback = augmentTestForCoverage(initial, context, { statements: 80, branches: 50, functions: 50, lines: 80, sourceFile: context.sourceFile, uncoveredBranches: [{ line, indexes: [1] }], uncoveredFunctions: [{ name: 'classify', line }] });
+  assert.ok(feedback);
+  assert.ok(feedback!.addedScenarios >= 2);
+  assert.match(feedback!.content, /coverage feedback for classify/);
+  assert.match(feedback!.content, /expect\(result\)\.toEqual\('high'\)/);
+  assert.match(feedback!.content, /expect\(result\)\.toEqual\('low'\)/);
+  assert.equal(augmentTestForCoverage(feedback!.content, context, { statements: 80, branches: 50, functions: 50, lines: 80, sourceFile: context.sourceFile, uncoveredFunctions: [{ name: 'classify', line }] }), undefined);
 });
 
 test('covers complex component branches consistently in every framework', () => {
@@ -164,13 +310,86 @@ test('covers complex component branches consistently in every framework', () => 
     assert.equal(context.dependencies[2].optional, true);
     assert.deepEqual(context.httpUsage[0].urls.sort(), ['/api/items', '/items']);
     assert.match(spec, /HttpClientTestingModule/);
-    assert.match(spec, /should expose the error state/);
-    assert.match(spec, /https:\/\/example\.test\/items/);
-    assert.match(spec, /every item-count status boundary/);
-    assert.match(spec, /recalculate active values/);
-    assert.match(spec, /batch threshold/);
-    assert.match(spec, /successful timer tick/);
+    assert.match(spec, /evaluateStatus control-flow paths/);
+    assert.match(spec, /evaluateStatus\(-1\)[\s\S]*expect\(subject\.status\)\.toEqual\('error'\)/);
+    assert.match(spec, /evaluateStatus\(0\)[\s\S]*expect\(subject\.status\)\.toEqual\('idle'\)/);
+    assert.match(spec, /evaluateStatus\(5\)[\s\S]*expect\(subject\.status\)\.toEqual\('success'\)/);
+    assert.doesNotMatch(spec, /recalculate active values|batch threshold|successful timer tick/);
     assert.doesNotMatch(spec, /provide: string/);
     assert.doesNotMatch(spec, /subject\.fetchData\(\)\.subscribe/);
   }
+});
+
+test('generates exhaustive dialog and XMLHttpRequest download scenarios', () => {
+  const source = `import { Component } from '@angular/core';
+    import { MatDialog } from '@angular/material/dialog';
+    @Component({ standalone: true, template: '' }) export class AplicativoComponent {
+      busy = false; percent = 0;
+      constructor(private dialog: MatDialog) {}
+      ngOnInit() {}
+      async transferPackage(primary: boolean) {
+        const resourcePath = '/files/mobile.bin';
+        const dialogRef = this.dialog.open(Object, { data: primary ? 'Primary' : 'Alternate' });
+        dialogRef.afterClosed().subscribe(async result => { if (result) { if (primary) {
+          this.busy = true; this.percent = 0;
+          try { const xhr = new XMLHttpRequest(); xhr.open('GET', window.location.origin + resourcePath, true); xhr.responseType = 'blob';
+            xhr.onprogress = event => { if (event.lengthComputable) this.percent = Math.round((event.loaded / event.total) * 100); };
+            xhr.onload = () => { if (xhr.status === 200) { const url = window.URL.createObjectURL(xhr.response); const a = document.createElement('a'); a.href = url; a.download = 'client.bin'; document.body.appendChild(a); a.click(); window.URL.revokeObjectURL(url); document.body.removeChild(a); } else console.error('Transfer failed:', xhr.statusText); setTimeout(() => this.busy = false, 4321); };
+            xhr.onerror = () => { this.busy = false; console.error('Transfer failed:', xhr.statusText); }; xhr.send();
+          } catch (error) { this.busy = false; console.error('Transfer failed:', error); }
+        } else window.location.href = 'https://fallback.test/app'; } });
+      }
+    }`;
+  for (const [framework, runner, adapter, marker] of [
+    [TestFramework.Jasmine, TestRunner.Karma, new JasmineKarmaAdapter(), "jasmine.createSpy('fn')"],
+    [TestFramework.Jest, TestRunner.Jest, new JestAdapter(), 'jest.fn()'],
+    [TestFramework.Vitest, TestRunner.Vitest, new VitestAdapter(), 'vi.fn()']
+  ] as const) {
+    const context = analyzeSource('C:/workspace/aplicativo.component.ts', source, diagnostic(framework, runner));
+    const spec = adapter.generateComponentTest(context);
+    assert.deepEqual(context.browserUsage, { xmlHttpRequest: true, objectUrl: true, dynamicAnchor: true, locationHref: true, timers: true });
+    assert.match(spec, /fixture\.detectChanges\(\)/);
+    assert.match(spec, /confirmation is cancelled/);
+    assert.match(spec, /both progress branches/);
+    assert.match(spec, /downloaded link for the success status/);
+    assert.match(spec, /non-success and network failures/);
+    assert.match(spec, /synchronous XMLHttpRequest failure/);
+    assert.match(spec, /alternate redirect branch/);
+    assert.match(spec, /subject\.transferPackage/);
+    assert.match(spec, /\/files\/mobile\.bin/);
+    assert.match(spec, /client\.bin/);
+    assert.match(spec, /subject\.percent/);
+    assert.match(spec, /subject\.busy/);
+    assert.match(spec, /4321/);
+    assert.match(spec, /https:\/\/fallback\.test\/app/);
+    assert.ok(spec.includes(marker));
+  }
+});
+
+test('builds generic control-flow metadata and boundary-value scenarios without method-name rules', () => {
+  const source = `@Component({ standalone: true, template: '' }) export class ArbitraryComponent {
+    result = '';
+    async classify(amount: number, label?: string) {
+      const normalized = label ?? 'fallback';
+      if (amount < 0) this.result = 'negative'; else if (amount === 10) this.result = 'ten'; else this.result = amount > 10 ? 'high' : 'low';
+      switch (normalized) { case 'x': this.result += 'x'; break; default: this.result += 'other'; }
+      try { return normalized?.trim(); } catch (error) { this.result = 'error'; return error; }
+    }
+  }`;
+  const context = analyzeSource('C:/workspace/arbitrary.component.ts', source, diagnostic(TestFramework.Jest, TestRunner.Jest));
+  const flow = context.controlFlow.find(item => item.methodName === 'classify')!;
+  assert.ok(flow);
+  assert.deepEqual(new Set(flow.decisions.map(item => item.kind)), new Set(['nullish', 'if', 'ternary', 'switch', 'optional-chain', 'catch']));
+  assert.ok(flow.parameters[0].candidates.includes('-1'));
+  assert.ok(flow.parameters[0].candidates.includes('10'));
+  assert.ok(flow.parameters[0].candidates.includes('11'));
+  assert.ok(flow.parameters[1].candidates.includes('undefined'));
+  const spec = new JestAdapter().generateComponentTest(context);
+  assert.match(spec, /classify control-flow paths/);
+  assert.match(spec, /\(subject as any\)\.classify\(/);
+  assert.doesNotMatch(spec, /expect\(subject\)\.toBeDefined/);
+  assert.match(spec, /classify\(-1,[^)]+\)[\s\S]*expect\(subject\.result\)\.toEqual\('negative'\)/);
+  assert.match(spec, /classify\(10,[^)]+\)[\s\S]*expect\(subject\.result\)\.toEqual\('ten'\)/);
+  assert.match(spec, /classify\(11,[^)]+\)[\s\S]*expect\(subject\.result\)\.toEqual\('high'\)/);
+  assert.doesNotMatch(spec, /toContain\(subject\.result\)/);
 });
