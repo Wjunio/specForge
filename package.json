@@ -2,7 +2,7 @@
   "name": "specforge-angular-tests",
   "displayName": "SpecForge Angular Test Generator",
   "description": "Analisa projetos Angular, gera testes de Component e Service e prova que executam no runner configurado.",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "publisher": "ArtePrime",
   "license": "MIT",
   "pricing": "Free",
